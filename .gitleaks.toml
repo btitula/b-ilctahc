@@ -1,0 +1,16 @@
+# Gitleaks configuration
+# https://github.com/gitleaks/gitleaks
+
+[extend]
+useDefault = true   # inherit all built-in rules
+
+[allowlist]
+description = "Allowlist for known safe values"
+paths = [
+    '''config\.yaml\.example''',   # example file — placeholder values only
+    '''CLAUDE\.md''',
+    '''install\.sh''',
+]
+regexes = [
+    '''sk-your-key-here''',        # literal placeholder in example/docs
+]
