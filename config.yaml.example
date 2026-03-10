@@ -5,8 +5,8 @@
 # ─────────────────────────────────────────────────────
 
 openai:
-  api_key: "sk-your-key-here"   # ← replace this
-  model: "gpt-4o"               # gpt-4o | gpt-4-turbo | gpt-3.5-turbo
+  api_key: "sk-your-key-here"   # ← replace this  # pragma: allowlist secret
+  model: "gpt-4o"               # gpt-4o | gpt-4o-mini | gpt-4-turbo | gpt-3.5-turbo
   max_tokens: 2048
   temperature: 0.7              # 0.0 = deterministic, 1.0 = creative
 
@@ -16,16 +16,26 @@ defaults:
   stream: true                  # stream tokens as they arrive
 
 display:
-  markdown: true                # render markdown (only when stream: false)
+  markdown: true                # render markdown after response
   show_project_header: true     # show project panel above response
   show_timestamp: true          # save timestamps in history
+
+cache:
+  enabled: true
+  ttl_days: 7                   # entries expire after N days
+  max_entries: 200              # LRU eviction when exceeded (per project)
+  similarity_threshold: 0.82   # 0.0–1.0, lower = more fuzzy matching
 
 # ─────────────────────────────────────────────────────
 # Custom projects live in: ~/.config/chatgpt-cli/projects/
 # Create <name>.yaml with keys: description, system_prompt
+# Optional per-project overrides: model, temperature
+#
 # Example: ~/.config/chatgpt-cli/projects/terraform.yaml
 #
-#   description: "Terraform / IaC expert"
+#   description: "Terraform IaC expert"
+#   model: gpt-4o               # overrides global model for this project
+#   temperature: 0.2            # overrides global temperature
 #   system_prompt: |
 #     You are a Terraform and IaC expert. Provide HCL examples,
 #     module structure advice, and state management best practices.
