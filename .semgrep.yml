@@ -1,0 +1,48 @@
+# Local Semgrep rules — project-specific secret patterns
+# Run standalone: semgrep --config=.semgrep.yml .
+
+rules:
+
+  - id: hardcoded-openai-key
+    patterns:
+      - pattern: |
+          "api_key": "$KEY"
+      - metavariable-regex:
+          metavariable: $KEY
+          regex: '^sk-[A-Za-z0-9\-_]{20,}$'
+    message: "Hardcoded OpenAI API key detected: $KEY — use env var or config file instead"
+    languages: [python, yaml]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+
+  - id: hardcoded-generic-api-key
+    patterns:
+      - pattern: |
+          api_key = "$KEY"
+      - metavariable-regex:
+          metavariable: $KEY
+          regex: '^[A-Za-z0-9\-_]{20,}$'
+    message: "Possible hardcoded API key — use os.environ or a config file"
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: security
+
+  - id: os-environ-get-default-secret
+    pattern: os.environ.get("...", "$SECRET")
+    message: "os.environ.get() with a hardcoded fallback secret — remove the default"
+    languages: [python]
+    severity: WARNING
+
+  - id: yaml-api-key
+    patterns:
+      - pattern: |
+          api_key: "$KEY"
+      - metavariable-regex:
+          metavariable: $KEY
+          regex: '^sk-[A-Za-z0-9\-_]{20,}$'
+    message: "Hardcoded OpenAI API key in YAML"
+    languages: [yaml]
+    severity: ERROR
