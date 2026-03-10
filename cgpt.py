@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sys
 import time
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -32,6 +33,15 @@ CONFIG_FILE  = CONFIG_DIR / "config.yaml"
 PROJECTS_DIR = CONFIG_DIR / "projects"
 HISTORY_DIR  = CONFIG_DIR / "history"
 CACHE_DIR    = CONFIG_DIR / "cache"
+USAGE_FILE   = CONFIG_DIR / "usage.json"
+
+# Price per 1M tokens (input, output) — update as OpenAI changes pricing
+MODEL_PRICING: dict[str, tuple[float, float]] = {
+    "gpt-4o":            (2.50,  10.00),
+    "gpt-4o-mini":       (0.15,   0.60),
+    "gpt-4-turbo":       (10.00, 30.00),
+    "gpt-3.5-turbo":     (0.50,   1.50),
+}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Defaults
@@ -144,6 +154,35 @@ def history_message_count(project: str) -> int:
         return 0
     with open(path) as f:
         return len(json.load(f))
+
+
+def history_search(project: str | None, keyword: str) -> list[dict]:
+    """Search conversation history for keyword across one or all projects.
+    Returns matched (project, role, timestamp, snippet) dicts, grouped by turn.
+    """
+    kw = keyword.lower()
+    projects = [project] if project else (
+        [p.stem for p in HISTORY_DIR.glob("*.json")] if HISTORY_DIR.exists() else []
+    )
+    results = []
+    for proj in sorted(projects):
+        messages = load_history(proj)
+        # walk pairs: user[i] + assistant[i+1]
+        for i in range(0, len(messages) - 1, 2):
+            user_msg = messages[i]
+            asst_msg = messages[i + 1] if i + 1 < len(messages) else {}
+            q = user_msg.get("content", "")
+            a = asst_msg.get("content", "")
+            if kw in q.lower() or kw in a.lower():
+                # truncate to first 120 chars for display
+                snippet = q if len(q) <= 120 else q[:117] + "..."
+                results.append({
+                    "project":   proj,
+                    "timestamp": user_msg.get("timestamp", ""),
+                    "question":  snippet,
+                    "matched":   "question" if kw in q.lower() else "answer",
+                })
+    return results
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -274,6 +313,29 @@ def cache_clear(project: str | None = None) -> None:
         shutil.rmtree(CACHE_DIR)
 
 
+def cache_search(project: str | None, keyword: str) -> list[dict]:
+    """Return cache entries whose original question contains keyword (case-insensitive)."""
+    kw = keyword.lower()
+    projects = [project] if project else (
+        [p.stem for p in CACHE_DIR.glob("*.json")] if CACHE_DIR.exists() else []
+    )
+    results = []
+    now = time.time()
+    for proj in sorted(projects):
+        data = _load_cache_data(proj)
+        for key, entry in data["entries"].items():
+            if kw in entry["question"].lower():
+                age_days = (now - entry["created_at"]) / 86400
+                results.append({
+                    "project":   proj,
+                    "question":  entry["question"],
+                    "hit_count": entry["hit_count"],
+                    "age_days":  round(age_days, 1),
+                    "key":       key,
+                })
+    return results
+
+
 def cache_get_stats(project: str | None = None) -> list[dict]:
     if not CACHE_DIR.exists():
         return []
@@ -319,6 +381,111 @@ def cache_restore(src: str) -> int:
 # ──────────────────────────────────────────────────────────────────────────────
 # Init
 # ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Usage / cost tracking
+# ──────────────────────────────────────────────────────────────────────────────
+def _calc_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    input_price, output_price = MODEL_PRICING.get(model, (0.0, 0.0))
+    return (prompt_tokens * input_price + completion_tokens * output_price) / 1_000_000
+
+
+def _load_usage() -> dict:
+    if not USAGE_FILE.exists():
+        return {"total_calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                "cost_usd": 0.0, "cache_hits": 0, "by_project": {}, "by_model": {}}
+    with open(USAGE_FILE) as f:
+        return json.load(f)
+
+
+def _save_usage(data: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(USAGE_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def record_usage(project: str, model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    cost = _calc_cost(model, prompt_tokens, completion_tokens)
+    data = _load_usage()
+
+    data["total_calls"]        += 1
+    data["prompt_tokens"]      += prompt_tokens
+    data["completion_tokens"]  += completion_tokens
+    data["cost_usd"]           += cost
+
+    p = data["by_project"].setdefault(project, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0})
+    p["calls"]             += 1
+    p["prompt_tokens"]     += prompt_tokens
+    p["completion_tokens"] += completion_tokens
+    p["cost_usd"]          += cost
+
+    m = data["by_model"].setdefault(model, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0})
+    m["calls"]             += 1
+    m["prompt_tokens"]     += prompt_tokens
+    m["completion_tokens"] += completion_tokens
+    m["cost_usd"]          += cost
+
+    _save_usage(data)
+    return cost
+
+
+def record_cache_hit() -> None:
+    data = _load_usage()
+    data["cache_hits"] += 1
+    _save_usage(data)
+
+
+def show_usage_report(project: str | None = None) -> None:
+    data = _load_usage()
+    total   = data["total_calls"]
+    hits    = data["cache_hits"]
+    api_calls = total - hits if total > hits else total
+
+    console.print()
+    console.print(Panel(
+        f"[bold]Total API calls:[/bold] {api_calls}   "
+        f"[bold]Cache hits:[/bold] [green]{hits}[/green]   "
+        f"[bold]Total cost:[/bold] [yellow]${data['cost_usd']:.4f}[/yellow]\n"
+        f"[dim]Prompt tokens: {data['prompt_tokens']:,}   "
+        f"Completion tokens: {data['completion_tokens']:,}   "
+        f"Total: {data['prompt_tokens'] + data['completion_tokens']:,}[/dim]",
+        title="Usage Report",
+        border_style="cyan",
+    ))
+
+    if project:
+        proj_data = data["by_project"].get(project)
+        if not proj_data:
+            console.print(f"[dim]No usage data for project: {project}[/dim]")
+            return
+        breakdown = {project: proj_data}
+    else:
+        breakdown = data["by_project"]
+
+    if breakdown:
+        table = Table(title="By Project", box=box.ROUNDED, border_style="cyan")
+        table.add_column("Project",    style="bold green", no_wrap=True)
+        table.add_column("API Calls",  justify="right")
+        table.add_column("Prompt",     justify="right", style="dim")
+        table.add_column("Completion", justify="right", style="dim")
+        table.add_column("Cost (USD)", justify="right", style="yellow")
+        for proj, d in sorted(breakdown.items()):
+            table.add_row(proj, str(d["calls"]),
+                          f"{d['prompt_tokens']:,}", f"{d['completion_tokens']:,}",
+                          f"${d['cost_usd']:.4f}")
+        console.print(table)
+
+    if data["by_model"] and not project:
+        table2 = Table(title="By Model", box=box.ROUNDED, border_style="cyan")
+        table2.add_column("Model",     style="bold green", no_wrap=True)
+        table2.add_column("API Calls", justify="right")
+        table2.add_column("Cost (USD)", justify="right", style="yellow")
+        for mdl, d in sorted(data["by_model"].items()):
+            table2.add_row(mdl, str(d["calls"]), f"${d['cost_usd']:.4f}")
+        console.print(table2)
+
+    console.print()
+
+
 def run_init() -> None:
     for d in (CONFIG_DIR, PROJECTS_DIR, HISTORY_DIR, CACHE_DIR):
         d.mkdir(parents=True, exist_ok=True)
@@ -376,6 +543,8 @@ def main(
     clear:          bool                = typer.Option(False,  "--clear",          "-c", help="Clear conversation history for the active project"),
     list_proj:      bool                = typer.Option(False,  "--list",           "-l", help="List available projects"),
     show_hist:      bool                = typer.Option(False,  "--history",        "-H", help="Show conversation history for the active project"),
+    hist_search_kw: Optional[str]      = typer.Option(None,   "--history-search",       help="Search conversation history by keyword"),
+    copy_last:      bool                = typer.Option(False,  "--copy",                 help="Copy last answer to clipboard"),
     new:            bool                = typer.Option(False,  "--new",            "-n", help="Start fresh (ignore history for this turn only)"),
     no_stream:      bool                = typer.Option(False,  "--no-stream",            help="Disable token streaming"),
     init:           bool                = typer.Option(False,  "--init",                 help="Initialise config and project files"),
@@ -385,6 +554,8 @@ def main(
     cache_delete:   Optional[str]       = typer.Option(None,   "--cache-delete",         help="Delete cache entry matching this question"),
     backup_file:    Optional[str]       = typer.Option(None,   "--cache-backup",         help="Backup all cache to a JSON file"),
     restore_file:   Optional[str]       = typer.Option(None,   "--cache-restore",        help="Restore cache from a backup JSON file"),
+    cache_search_kw: Optional[str]     = typer.Option(None,   "--cache-search",          help="Search cached questions by keyword"),
+    usage:          bool                = typer.Option(False,  "--usage",                 help="Show token usage and cost report"),
 ) -> None:
     # ── Init ──────────────────────────────────────────────────────────────────
     if init:
@@ -402,6 +573,13 @@ def main(
         question_text    = " ".join(args)
     else:
         resolved_project, question_text = _parse_project_and_question(args, default_project)
+
+    # ── Piped stdin ───────────────────────────────────────────────────────────
+    piped_input = ""
+    if not sys.stdin.isatty():
+        piped_input = sys.stdin.read().strip()
+        if piped_input:
+            question_text = f"{question_text}\n\n{piped_input}" if question_text.strip() else piped_input
 
     # ── Cache stats ───────────────────────────────────────────────────────────
     if show_cache:
@@ -449,6 +627,69 @@ def main(
     if restore_file:
         n = cache_restore(restore_file)
         console.print(f"[green]Cache restored:[/green] {n} project(s) from [bold]{restore_file}[/bold]")
+        return
+
+    # ── Cache search ──────────────────────────────────────────────────────────
+    if cache_search_kw:
+        results = cache_search(resolved_project if project else None, cache_search_kw)
+        if not results:
+            console.print(f"[dim]No cached entries matching:[/dim] [bold]{cache_search_kw}[/bold]")
+            return
+        table = Table(
+            title=f"Cache search: \"{cache_search_kw}\"",
+            box=box.ROUNDED, border_style="cyan",
+        )
+        table.add_column("Project",   style="bold green", no_wrap=True)
+        table.add_column("Question",  style="white")
+        table.add_column("Hits",      justify="right", style="cyan")
+        table.add_column("Age (days)", justify="right", style="dim")
+        for r in results:
+            table.add_row(r["project"], r["question"], str(r["hit_count"]), str(r["age_days"]))
+        console.print()
+        console.print(table)
+        console.print()
+        return
+
+    # ── Usage report ──────────────────────────────────────────────────────────
+    if usage:
+        show_usage_report(resolved_project if project else None)
+        return
+
+    # ── Copy last answer to clipboard ─────────────────────────────────────────
+    if copy_last:
+        hist = load_history(resolved_project)
+        last = next((m["content"] for m in reversed(hist) if m["role"] == "assistant"), None)
+        if not last:
+            console.print(f"[yellow]No answer in history for[/yellow] [bold]{resolved_project}[/bold]")
+            return
+        try:
+            import subprocess
+            subprocess.run("pbcopy", input=last.encode(), check=True)
+            preview = last[:80].replace("\n", " ")
+            console.print(f"[green]Copied to clipboard:[/green] [dim]{preview}...[/dim]")
+        except FileNotFoundError:
+            console.print("[red]pbcopy not found.[/red] Only supported on macOS.")
+        return
+
+    # ── History search ────────────────────────────────────────────────────────
+    if hist_search_kw:
+        results = history_search(resolved_project if project else None, hist_search_kw)
+        if not results:
+            console.print(f"[dim]No history matching:[/dim] [bold]{hist_search_kw}[/bold]")
+            return
+        table = Table(
+            title=f"History search: \"{hist_search_kw}\"",
+            box=box.ROUNDED, border_style="cyan",
+        )
+        table.add_column("Project",   style="bold green", no_wrap=True)
+        table.add_column("When",      style="dim",        no_wrap=True)
+        table.add_column("Matched in", style="dim",       no_wrap=True)
+        table.add_column("Question",  style="white")
+        for r in results:
+            table.add_row(r["project"], r["timestamp"], r["matched"], r["question"])
+        console.print()
+        console.print(table)
+        console.print()
         return
 
     # ── List projects ─────────────────────────────────────────────────────────
@@ -531,6 +772,8 @@ def main(
         raise typer.Exit(1)
 
     system_prompt = proj["system_prompt"]
+    model       = proj.get("model",       config["openai"]["model"])
+    temperature = proj.get("temperature", config["openai"]["temperature"])
 
     # ── Build conversation history ────────────────────────────────────────────
     conv_history = [] if new else load_history(resolved_project)
@@ -538,10 +781,14 @@ def main(
     # ── Header ────────────────────────────────────────────────────────────────
     if config["display"]["show_project_header"]:
         turns_label = f"{len(conv_history)//2} prior turns" if conv_history else "new conversation"
+        pipe_label  = "  · piped input" if piped_input else ""
+        display_text = question_text if not piped_input else (
+            question_text[: question_text.index(piped_input)].strip() or "[piped input]"
+        )
         console.print()
         console.print(Panel(
-            Text(question_text, style="bold yellow"),
-            title=f"[cyan] {resolved_project} [/cyan]  [dim]{turns_label}[/dim]",
+            Text(display_text, style="bold yellow"),
+            title=f"[cyan] {resolved_project} [/cyan]  [dim]{turns_label} · {model}{pipe_label}[/dim]",
             border_style="dim blue",
             padding=(0, 1),
         ))
@@ -551,7 +798,9 @@ def main(
         hit = cache_lookup(resolved_project, question_text, cache_cfg)
         if hit:
             pct = int(hit["score"] * 100)
-            console.print(f"\n[dim]cached · {pct}% match[/dim]\n")
+            original = hit["entry"]["question"]
+            record_cache_hit()
+            console.print(f"\n[dim]cached · {pct}% match — \"{original}\"[/dim]\n")
             if config["display"]["markdown"]:
                 console.print(Markdown(hit["entry"]["answer"]))
             else:
@@ -584,22 +833,29 @@ def main(
     render_md      = config["display"]["markdown"]
 
     try:
-        full_response = ""
+        full_response  = ""
+        prompt_tokens  = 0
+        completion_tokens = 0
         console.print()
 
         if stream_enabled:
             # ── Collect tokens behind spinner, render markdown once ────────
             stream = client.chat.completions.create(
-                model       = config["openai"]["model"],
-                max_tokens  = config["openai"]["max_tokens"],
-                temperature = config["openai"]["temperature"],
-                messages    = messages,
-                stream      = True,
+                model          = model,
+                max_tokens     = config["openai"]["max_tokens"],
+                temperature    = temperature,
+                messages       = messages,
+                stream         = True,
+                stream_options = {"include_usage": True},
             )
             with console.status("[dim]thinking...[/dim]", spinner="dots"):
                 for chunk in stream:
-                    delta = chunk.choices[0].delta.content or ""
-                    full_response += delta
+                    if chunk.choices:
+                        delta = chunk.choices[0].delta.content or ""
+                        full_response += delta
+                    if chunk.usage:
+                        prompt_tokens     = chunk.usage.prompt_tokens
+                        completion_tokens = chunk.usage.completion_tokens
             if render_md:
                 console.print(Markdown(full_response))
             else:
@@ -609,12 +865,14 @@ def main(
         else:
             # ── Non-streaming ──────────────────────────────────────────────
             response = client.chat.completions.create(
-                model       = config["openai"]["model"],
+                model       = model,
                 max_tokens  = config["openai"]["max_tokens"],
-                temperature = config["openai"]["temperature"],
+                temperature = temperature,
                 messages    = messages,
             )
-            full_response = response.choices[0].message.content
+            full_response     = response.choices[0].message.content
+            prompt_tokens     = response.usage.prompt_tokens
+            completion_tokens = response.usage.completion_tokens
             if render_md:
                 console.print(Markdown(full_response))
             else:
@@ -631,13 +889,23 @@ def main(
         console.print(f"\n[red]API Error:[/red] {e}")
         raise typer.Exit(1)
 
+    # ── Record usage + display token line ─────────────────────────────────────
+    if prompt_tokens or completion_tokens:
+        cost = record_usage(resolved_project, model, prompt_tokens, completion_tokens)
+        total_tokens = prompt_tokens + completion_tokens
+        console.print(
+            f"[dim]tokens: {prompt_tokens:,} prompt · {completion_tokens:,} completion"
+            f" · {total_tokens:,} total · ${cost:.4f}[/dim]"
+        )
+        console.print()
+
     # ── Save to history ───────────────────────────────────────────────────────
     ts = datetime.now().strftime("%Y-%m-%d %H:%M") if config["display"]["show_timestamp"] else ""
     conv_history.append({"role": "user",      "content": question_text,  "timestamp": ts})
     conv_history.append({"role": "assistant", "content": full_response,  "timestamp": ts})
     save_history(resolved_project, conv_history, limit=config["defaults"]["history_limit"])
 
-    # ── Store in cache (only fresh single-turn queries) ───────────────────────
+    # ── Store in cache ─────────────────────────────────────────────────────────
     if not no_cache:
         cache_store(resolved_project, question_text, full_response, cache_cfg)
 
