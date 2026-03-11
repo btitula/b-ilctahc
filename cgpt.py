@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-ChatGPT CLI — ?? command
-Supports projects, streaming, persistent history, rich output, and semantic caching.
+AI CLI — ?? command
+Supports OpenAI and Claude (Anthropic) providers, projects, streaming,
+persistent history, rich output, and semantic caching.
 """
 
 from __future__ import annotations
@@ -35,13 +36,21 @@ HISTORY_DIR  = CONFIG_DIR / "history"
 CACHE_DIR    = CONFIG_DIR / "cache"
 USAGE_FILE   = CONFIG_DIR / "usage.json"
 
-# Price per 1M tokens (input, output) — update as OpenAI changes pricing
+# Price per 1M tokens (input, output) — update as providers change pricing
 MODEL_PRICING: dict[str, tuple[float, float]] = {
-    "gpt-4o":            (2.50,  10.00),
-    "gpt-4o-mini":       (0.15,   0.60),
-    "gpt-4-turbo":       (10.00, 30.00),
-    "gpt-3.5-turbo":     (0.50,   1.50),
+    # OpenAI
+    "gpt-4o":                    (2.50,  10.00),
+    "gpt-4o-mini":               (0.15,   0.60),
+    "gpt-4-turbo":               (10.00, 30.00),
+    "gpt-3.5-turbo":             (0.50,   1.50),
+    # Anthropic Claude
+    "claude-opus-4-6":           (15.00, 75.00),
+    "claude-sonnet-4-6":         (3.00,  15.00),
+    "claude-haiku-4-5-20251001": (0.80,   4.00),
 }
+
+# Maps provider name (used in CLI/defaults) → config section key
+PROVIDER_CFG_KEY = {"openai": "openai", "claude": "anthropic"}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Defaults
@@ -53,7 +62,14 @@ DEFAULT_CONFIG = {
         "max_tokens": 2048,
         "temperature": 0.7,
     },
+    "anthropic": {
+        "api_key": "your-key-here",  # pragma: allowlist secret
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 2048,
+        "temperature": 0.7,
+    },
     "defaults": {
+        "provider": "openai",        # openai | claude
         "project": "default",
         "history_limit": 20,
         "stream": True,
@@ -392,9 +408,11 @@ def _calc_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
 def _load_usage() -> dict:
     if not USAGE_FILE.exists():
         return {"total_calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
-                "cost_usd": 0.0, "cache_hits": 0, "by_project": {}, "by_model": {}}
-    with open(USAGE_FILE) as f:
-        return json.load(f)
+                "cost_usd": 0.0, "cache_hits": 0, "by_project": {}, "by_model": {},
+                "by_provider": {}}
+    data = json.load(open(USAGE_FILE))
+    data.setdefault("by_provider", {})   # migrate old files
+    return data
 
 
 def _save_usage(data: dict) -> None:
@@ -403,7 +421,8 @@ def _save_usage(data: dict) -> None:
         json.dump(data, f, indent=2)
 
 
-def record_usage(project: str, model: str, prompt_tokens: int, completion_tokens: int) -> float:
+def record_usage(project: str, model: str, prompt_tokens: int, completion_tokens: int,
+                 provider: str = "openai") -> float:
     cost = _calc_cost(model, prompt_tokens, completion_tokens)
     data = _load_usage()
 
@@ -423,6 +442,12 @@ def record_usage(project: str, model: str, prompt_tokens: int, completion_tokens
     m["prompt_tokens"]     += prompt_tokens
     m["completion_tokens"] += completion_tokens
     m["cost_usd"]          += cost
+
+    pr = data["by_provider"].setdefault(provider, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0})
+    pr["calls"]             += 1
+    pr["prompt_tokens"]     += prompt_tokens
+    pr["completion_tokens"] += completion_tokens
+    pr["cost_usd"]          += cost
 
     _save_usage(data)
     return cost
@@ -473,6 +498,19 @@ def show_usage_report(project: str | None = None) -> None:
                           f"{d['prompt_tokens']:,}", f"{d['completion_tokens']:,}",
                           f"${d['cost_usd']:.4f}")
         console.print(table)
+
+    if not project and data.get("by_provider"):
+        table_pr = Table(title="By Provider", box=box.ROUNDED, border_style="cyan")
+        table_pr.add_column("Provider",   style="bold green", no_wrap=True)
+        table_pr.add_column("API Calls",  justify="right")
+        table_pr.add_column("Prompt",     justify="right", style="dim")
+        table_pr.add_column("Completion", justify="right", style="dim")
+        table_pr.add_column("Cost (USD)", justify="right", style="yellow")
+        for prov, d in sorted(data["by_provider"].items()):
+            table_pr.add_row(prov, str(d["calls"]),
+                             f"{d['prompt_tokens']:,}", f"{d['completion_tokens']:,}",
+                             f"${d['cost_usd']:.4f}")
+        console.print(table_pr)
 
     if data["by_model"] and not project:
         table2 = Table(title="By Model", box=box.ROUNDED, border_style="cyan")
@@ -547,6 +585,7 @@ def main(
     copy_last:      bool                = typer.Option(False,  "--copy",                 help="Copy last answer to clipboard"),
     new:            bool                = typer.Option(False,  "--new",            "-n", help="Start fresh (ignore history for this turn only)"),
     no_stream:      bool                = typer.Option(False,  "--no-stream",            help="Disable token streaming"),
+    provider:       Optional[str]       = typer.Option(None,   "--provider",      "-P",  help="AI provider: openai or claude (overrides config)"),
     init:           bool                = typer.Option(False,  "--init",                 help="Initialise config and project files"),
     no_cache:       bool                = typer.Option(False,  "--no-cache",       "-C", help="Bypass cache for this query"),
     show_cache:     bool                = typer.Option(False,  "--cache-stats",          help="Show cache hit/miss statistics"),
@@ -556,6 +595,8 @@ def main(
     restore_file:   Optional[str]       = typer.Option(None,   "--cache-restore",        help="Restore cache from a backup JSON file"),
     cache_search_kw: Optional[str]     = typer.Option(None,   "--cache-search",          help="Search cached questions by keyword"),
     usage:          bool                = typer.Option(False,  "--usage",                 help="Show token usage and cost report"),
+    set_provider:   Optional[str]       = typer.Option(None,   "--set",                   help="Set default provider in config: openai or claude"),
+    show_status:    bool                = typer.Option(False,  "--status",                help="Show current provider, model, and config settings"),
 ) -> None:
     # ── Init ──────────────────────────────────────────────────────────────────
     if init:
@@ -563,6 +604,50 @@ def main(
         return
 
     config = load_config()
+
+    # ── Set provider ──────────────────────────────────────────────────────────
+    if set_provider:
+        if set_provider not in ("openai", "claude"):
+            console.print(f"[red]Error: unknown provider:[/red] [bold]{set_provider}[/bold]  (use openai or claude)")
+            raise typer.Exit(1)
+        cfg = load_config()
+        cfg["defaults"]["provider"] = set_provider
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_FILE, "w") as f:
+            yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+        console.print(f"[green]Default provider set to:[/green] [bold]{set_provider}[/bold]")
+        console.print(f"[dim]Edit model/key: {CONFIG_FILE}[/dim]")
+        return
+
+    # ── Status ────────────────────────────────────────────────────────────────
+    if show_status:
+        cur_provider = config["defaults"].get("provider", "openai")
+        rows = []
+        for prov in ("openai", "claude"):
+            prov_cfg = config.get(PROVIDER_CFG_KEY[prov], {})
+            key = prov_cfg.get("api_key", "")
+            key_status = "[green]set[/green]" if key and "your-key" not in key else "[red]not set[/red]"
+            model_val  = prov_cfg.get("model", DEFAULT_CONFIG.get(prov, {}).get("model", "?"))
+            active     = "[bold cyan]* active[/bold cyan]" if prov == cur_provider else ""
+            rows.append((prov, key_status, model_val, active))
+
+        table = Table(title="Current Settings", box=box.ROUNDED, border_style="cyan")
+        table.add_column("Provider",  style="bold green", no_wrap=True)
+        table.add_column("API Key",   justify="center")
+        table.add_column("Model",     style="dim")
+        table.add_column("",          justify="left")
+        for prov, ks, mdl, active in rows:
+            table.add_row(prov, ks, mdl, active)
+        console.print()
+        console.print(table)
+        console.print(
+            f"\n[dim]Default project:[/dim] {config['defaults'].get('project', 'default')}  "
+            f"[dim]History limit:[/dim] {config['defaults'].get('history_limit', 20)}  "
+            f"[dim]Stream:[/dim] {config['defaults'].get('stream', True)}  "
+            f"[dim]Cache:[/dim] {config.get('cache', {}).get('enabled', True)}"
+        )
+        console.print(f"[dim]Config:[/dim] {CONFIG_FILE}\n")
+        return
     cache_cfg = config.get("cache", DEFAULT_CONFIG["cache"])
     default_project = config["defaults"]["project"]
 
@@ -758,29 +843,49 @@ def main(
         console.print("Usage:")
         console.print("  [bold]??[/bold] [dim]your question[/dim]")
         console.print("  [bold]?? devops[/bold] [dim]how do I drain an ECS task?[/dim]")
-        console.print("  [bold]?? -p python[/bold] [dim]write a boto3 s3 lister[/dim]")
+        console.print("  [bold]?? nodejs[/bold] [dim]NestJS CRUD endpoint with Prisma[/dim]")
+        console.print("  [bold]?? reactjs[/bold] [dim]login form with react-hook-form and zod[/dim]")
+        console.print("  [bold]?? frontend[/bold] [dim]responsive card grid with CSS Grid and dark mode[/dim]")
         console.print("  [bold]cat file.sql | ?? sql[/bold] [dim]review this query[/dim]")
         console.print()
+        console.print("Projects:")
+        console.print("  [dim]devops[/dim]     AWS — ECS Fargate, EKS, Aurora, ElastiCache, CloudFront")
+        console.print("  [dim]python[/dim]     FastAPI, Pydantic v2, SQLAlchemy, boto3, Lambda")
+        console.print("  [dim]nodejs[/dim]     NestJS / Express, TypeScript, Prisma, Zod, REST/GraphQL")
+        console.print("  [dim]reactjs[/dim]    React 18, TypeScript, TanStack Query, Tailwind, shadcn/ui")
+        console.print("  [dim]frontend[/dim]   HTML5, CSS3, vanilla JS, responsive, accessibility (WCAG)")
+        console.print("  [dim]sql[/dim]        Aurora MySQL/PG, ElastiCache Valkey, RDS Proxy")
+        console.print("  [dim]monitoring[/dim] Prometheus, Grafana, Thanos, Alertmanager, CloudWatch")
+        console.print("  [dim]pipeline[/dim]   Bitbucket Pipelines, Jenkins, ECS/EKS deployments")
+        console.print("  [dim]review[/dim]     Code review — security, IaC, Dockerfiles, SOC2")
+        console.print("  [dim]security[/dim]   IAM, KMS, GuardDuty, Security Hub, SOC2")
+        console.print("  [bold]?? -l[/bold]              [dim]full list with history + cache counts[/dim]")
+        console.print()
         console.print("Conversations:")
-        console.print("  [bold]?? -l[/bold]                  [dim]list all projects + history + cache[/dim]")
-        console.print("  [bold]?? -H[/bold]                  [dim]show history (current project)[/dim]")
-        console.print("  [bold]?? -c[/bold]                  [dim]clear history (current project)[/dim]")
-        console.print("  [bold]?? -n devops[/bold] [dim]...[/dim]    [dim]start fresh (ignore history this turn)[/dim]")
-        console.print("  [bold]?? --history-search[/bold] [dim]KEYWORD  [dim]search history across projects[/dim]")
-        console.print("  [bold]?? --copy[/bold]              [dim]copy last answer to clipboard[/dim]")
+        console.print("  [bold]?? -H[/bold]                        [dim]show history (current project)[/dim]")
+        console.print("  [bold]?? -c[/bold]                        [dim]clear history (current project)[/dim]")
+        console.print("  [bold]?? -n devops[/bold] [dim]...[/dim]        [dim]start fresh (ignore history this turn)[/dim]")
+        console.print("  [bold]?? --history-search[/bold] [dim]KEYWORD  search history across projects[/dim]")
+        console.print("  [bold]?? --copy[/bold]                    [dim]copy last answer to clipboard[/dim]")
+        console.print()
+        console.print("Provider:")
+        console.print("  [bold]?? --status[/bold]                  [dim]show active provider, model, API key status[/dim]")
+        console.print("  [bold]?? --set claude[/bold]              [dim]switch default provider to Claude[/dim]")
+        console.print("  [bold]?? --set openai[/bold]              [dim]switch default provider to OpenAI[/dim]")
+        console.print("  [bold]?? -P claude[/bold] [dim]...[/dim]        [dim]use Claude for this query only[/dim]")
         console.print()
         console.print("Cache:")
-        console.print("  [bold]?? --cache-stats[/bold]       [dim]hit/miss stats per project[/dim]")
-        console.print("  [bold]?? --cache-search[/bold] [dim]KEYWORD  search cached questions[/dim]")
-        console.print("  [bold]?? --clear-cache[/bold]       [dim]clear cache (add -p for one project)[/dim]")
-        console.print("  [bold]?? --cache-delete[/bold] [dim]QUESTION  delete matching cache entry[/dim]")
-        console.print("  [bold]?? --cache-backup[/bold] [dim]FILE    backup cache to JSON[/dim]")
-        console.print("  [bold]?? --cache-restore[/bold] [dim]FILE   restore cache from JSON[/dim]")
-        console.print("  [bold]?? -C[/bold] [dim]...[/dim]            [dim]bypass cache for this query[/dim]")
+        console.print("  [bold]?? --cache-stats[/bold]             [dim]hit/miss stats per project[/dim]")
+        console.print("  [bold]?? --cache-search[/bold] [dim]KEYWORD     search cached questions[/dim]")
+        console.print("  [bold]?? --clear-cache[/bold]             [dim]clear cache (add -p for one project)[/dim]")
+        console.print("  [bold]?? --cache-delete[/bold] [dim]QUESTION    delete matching cache entry[/dim]")
+        console.print("  [bold]?? --cache-backup[/bold] [dim]FILE        backup cache to JSON[/dim]")
+        console.print("  [bold]?? --cache-restore[/bold] [dim]FILE       restore cache from JSON[/dim]")
+        console.print("  [bold]?? -C[/bold] [dim]...[/dim]               [dim]bypass cache for this query[/dim]")
         console.print()
         console.print("Usage & setup:")
-        console.print("  [bold]?? --usage[/bold]             [dim]token usage and cost report[/dim]")
-        console.print("  [bold]?? --init[/bold]              [dim]set up config and project files[/dim]")
+        console.print("  [bold]?? --usage[/bold]                   [dim]token usage and cost report (by provider/project)[/dim]")
+        console.print("  [bold]?? --init[/bold]                    [dim]set up config and project files[/dim]")
         raise typer.Exit(1)
 
     # ── Load project ──────────────────────────────────────────────────────────
@@ -790,9 +895,17 @@ def main(
         console.print("Run [bold]?? --list[/bold] to see available projects")
         raise typer.Exit(1)
 
+    # ── Resolve provider: project yaml → CLI flag → config default ───────────
+    effective_provider = proj.get("provider") or provider or config["defaults"].get("provider", "openai")
+    if effective_provider not in ("openai", "claude"):
+        console.print(f"[red]Error: unknown provider:[/red] [bold]{effective_provider}[/bold]  (use openai or claude)")
+        raise typer.Exit(1)
+    provider_cfg = config.get(PROVIDER_CFG_KEY[effective_provider], config["openai"])
+
     system_prompt = proj["system_prompt"]
-    model       = proj.get("model",       config["openai"]["model"])
-    temperature = proj.get("temperature", config["openai"]["temperature"])
+    model       = proj.get("model",       provider_cfg["model"])
+    temperature = proj.get("temperature", provider_cfg["temperature"])
+    max_tokens  = provider_cfg.get("max_tokens", 2048)
 
     # ── Build conversation history ────────────────────────────────────────────
     conv_history = [] if new else load_history(resolved_project)
@@ -807,7 +920,7 @@ def main(
         console.print()
         console.print(Panel(
             Text(display_text, style="bold yellow"),
-            title=f"[cyan] {resolved_project} [/cyan]  [dim]{turns_label} · {model}{pipe_label}[/dim]",
+            title=f"[cyan] {resolved_project} [/cyan]  [dim]{turns_label} · {effective_provider} · {model}{pipe_label}[/dim]",
             border_style="dim blue",
             padding=(0, 1),
         ))
@@ -828,75 +941,108 @@ def main(
             return
 
     # ── API key guard ─────────────────────────────────────────────────────────
-    api_key = config["openai"]["api_key"]
-    if api_key.startswith("sk-your-key") or api_key == "your-key-here": # pragma: allowlist secret
-        console.print(f"\n[red]Error: API key not configured.[/red]")
+    api_key = provider_cfg["api_key"]
+    if api_key in ("your-key-here",) or api_key.startswith("sk-your-key"):  # pragma: allowlist secret
+        console.print(f"\n[red]Error: {effective_provider} API key not configured.[/red]")
         console.print(f"   Edit: [bold]{CONFIG_FILE}[/bold]")
         raise typer.Exit(1)
-
-    # ── OpenAI call ───────────────────────────────────────────────────────────
-    try:
-        from openai import OpenAI  # lazy import — faster startup for non-API commands
-        client = OpenAI(api_key=api_key)
-    except ImportError:
-        console.print("[red]Error: openai package not installed.[/red]")
-        console.print("   Run: [bold]pip install openai[/bold]")
-        raise typer.Exit(1)
-
-    messages: list[dict] = [{"role": "system", "content": system_prompt}]
-    for m in conv_history:
-        messages.append({"role": m["role"], "content": m["content"]})
-    messages.append({"role": "user", "content": question_text})
 
     stream_enabled = config["defaults"]["stream"] and not no_stream
     render_md      = config["display"]["markdown"]
 
-    try:
-        full_response  = ""
-        prompt_tokens  = 0
-        completion_tokens = 0
-        console.print()
+    full_response     = ""
+    prompt_tokens     = 0
+    completion_tokens = 0
+    console.print()
 
-        if stream_enabled:
-            # ── Collect tokens behind spinner, render markdown once ────────
-            stream = client.chat.completions.create(
-                model          = model,
-                max_tokens     = config["openai"]["max_tokens"],
-                temperature    = temperature,
-                messages       = messages,
-                stream         = True,
-                stream_options = {"include_usage": True},
-            )
-            with console.status("[dim]thinking...[/dim]", spinner="dots"):
-                for chunk in stream:
-                    if chunk.choices:
-                        delta = chunk.choices[0].delta.content or ""
-                        full_response += delta
-                    if chunk.usage:
-                        prompt_tokens     = chunk.usage.prompt_tokens
-                        completion_tokens = chunk.usage.completion_tokens
-            if render_md:
-                console.print(Markdown(full_response))
+    try:
+        if effective_provider == "claude":
+            # ── Anthropic Claude ──────────────────────────────────────────
+            try:
+                from anthropic import Anthropic  # lazy import
+            except ImportError:
+                console.print("[red]Error: anthropic package not installed.[/red]")
+                console.print("   Run: [bold]pip install anthropic[/bold]")
+                raise typer.Exit(1)
+
+            client = Anthropic(api_key=api_key)
+            anth_messages = [{"role": m["role"], "content": m["content"]} for m in conv_history]
+            anth_messages.append({"role": "user", "content": question_text})
+
+            if stream_enabled:
+                with console.status("[dim]thinking...[/dim]", spinner="dots"):
+                    with client.messages.stream(
+                        model      = model,
+                        max_tokens = max_tokens,
+                        temperature = temperature,
+                        system     = system_prompt,
+                        messages   = anth_messages,
+                    ) as stream:
+                        for text in stream.text_stream:
+                            full_response += text
+                        final = stream.get_final_message()
+                        prompt_tokens     = final.usage.input_tokens
+                        completion_tokens = final.usage.output_tokens
             else:
-                console.print(full_response)
-            console.print()
+                response = client.messages.create(
+                    model       = model,
+                    max_tokens  = max_tokens,
+                    temperature = temperature,
+                    system      = system_prompt,
+                    messages    = anth_messages,
+                )
+                full_response     = response.content[0].text
+                prompt_tokens     = response.usage.input_tokens
+                completion_tokens = response.usage.output_tokens
 
         else:
-            # ── Non-streaming ──────────────────────────────────────────────
-            response = client.chat.completions.create(
-                model       = model,
-                max_tokens  = config["openai"]["max_tokens"],
-                temperature = temperature,
-                messages    = messages,
-            )
-            full_response     = response.choices[0].message.content
-            prompt_tokens     = response.usage.prompt_tokens
-            completion_tokens = response.usage.completion_tokens
-            if render_md:
-                console.print(Markdown(full_response))
+            # ── OpenAI ────────────────────────────────────────────────────
+            try:
+                from openai import OpenAI  # lazy import — faster startup for non-API commands
+            except ImportError:
+                console.print("[red]Error: openai package not installed.[/red]")
+                console.print("   Run: [bold]pip install openai[/bold]")
+                raise typer.Exit(1)
+
+            client = OpenAI(api_key=api_key)
+            messages: list[dict] = [{"role": "system", "content": system_prompt}]
+            for m in conv_history:
+                messages.append({"role": m["role"], "content": m["content"]})
+            messages.append({"role": "user", "content": question_text})
+
+            if stream_enabled:
+                stream = client.chat.completions.create(
+                    model          = model,
+                    max_tokens     = max_tokens,
+                    temperature    = temperature,
+                    messages       = messages,
+                    stream         = True,
+                    stream_options = {"include_usage": True},
+                )
+                with console.status("[dim]thinking...[/dim]", spinner="dots"):
+                    for chunk in stream:
+                        if chunk.choices:
+                            delta = chunk.choices[0].delta.content or ""
+                            full_response += delta
+                        if chunk.usage:
+                            prompt_tokens     = chunk.usage.prompt_tokens
+                            completion_tokens = chunk.usage.completion_tokens
             else:
-                console.print(full_response)
-            console.print()
+                response = client.chat.completions.create(
+                    model       = model,
+                    max_tokens  = max_tokens,
+                    temperature = temperature,
+                    messages    = messages,
+                )
+                full_response     = response.choices[0].message.content
+                prompt_tokens     = response.usage.prompt_tokens
+                completion_tokens = response.usage.completion_tokens
+
+        if render_md:
+            console.print(Markdown(full_response))
+        else:
+            console.print(full_response)
+        console.print()
 
     except KeyboardInterrupt:
         console.print("\n[dim]Interrupted.[/dim]")
@@ -910,7 +1056,8 @@ def main(
 
     # ── Record usage + display token line ─────────────────────────────────────
     if prompt_tokens or completion_tokens:
-        cost = record_usage(resolved_project, model, prompt_tokens, completion_tokens)
+        cost = record_usage(resolved_project, model, prompt_tokens, completion_tokens,
+                            provider=effective_provider)
         total_tokens = prompt_tokens + completion_tokens
         console.print(
             f"[dim]tokens: {prompt_tokens:,} prompt · {completion_tokens:,} completion"
