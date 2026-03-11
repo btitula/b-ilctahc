@@ -29,8 +29,8 @@ echo "  OK: $PY_VER at $PYTHON"
 # ── 2. Install dependencies ───────────────────────────────────────────────────
 echo ""
 echo "→ Installing Python dependencies..."
-$PYTHON -m pip install --quiet --upgrade openai typer rich pyyaml
-echo "  OK: openai typer rich pyyaml installed"
+$PYTHON -m pip install --quiet --upgrade openai anthropic typer rich pyyaml
+echo "  OK: openai anthropic typer rich pyyaml installed"
 
 # ── 3. Copy script to ~/.local/bin ────────────────────────────────────────────
 echo ""

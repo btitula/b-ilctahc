@@ -1,7 +1,7 @@
 # ~/.config/chatgpt-cli/config.yaml
 # ─────────────────────────────────────────────────────
-# ChatGPT CLI Configuration
-# chmod 600 this file after setting your API key!
+# AI CLI Configuration
+# chmod 600 this file after setting your API keys!
 # ─────────────────────────────────────────────────────
 
 openai:
@@ -10,7 +10,14 @@ openai:
   max_tokens: 2048
   temperature: 0.7              # 0.0 = deterministic, 1.0 = creative
 
+anthropic:
+  api_key: "sk-ant-your-key-here"  # ← replace this  # pragma: allowlist secret
+  model: "claude-sonnet-4-6"       # claude-opus-4-6 | claude-sonnet-4-6 | claude-haiku-4-5-20251001
+  max_tokens: 2048
+  temperature: 0.7
+
 defaults:
+  provider: "openai"            # openai | claude  — default AI provider
   project: "default"            # project used when none specified
   history_limit: 20             # max messages kept per project (each turn = 2)
   stream: true                  # stream tokens as they arrive
@@ -29,12 +36,13 @@ cache:
 # ─────────────────────────────────────────────────────
 # Custom projects live in: ~/.config/chatgpt-cli/projects/
 # Create <name>.yaml with keys: description, system_prompt
-# Optional per-project overrides: model, temperature
+# Optional per-project overrides: model, temperature, provider
 #
 # Example: ~/.config/chatgpt-cli/projects/terraform.yaml
 #
 #   description: "Terraform IaC expert"
-#   model: gpt-4o               # overrides global model for this project
+#   provider: claude             # use Claude for this project
+#   model: claude-sonnet-4-6    # overrides global model for this project
 #   temperature: 0.2            # overrides global temperature
 #   system_prompt: |
 #     You are a Terraform and IaC expert. Provide HCL examples,
